@@ -80,8 +80,9 @@ pub struct EscrowJob {
     pub expires_at: u64,
     pub milestones: Vec<Milestone>,
     pub requires_multisig: bool,
-    pub token_decimals: u32,   // populated during deposit via token::Client::decimals()
+    pub token_decimals: u32, // populated during deposit via token::Client::decimals()
     pub dispute_deadline: u64, // 0 = no active dispute; set when dispute is raised/opened
+    pub funded_ledger_seq: u32, // ledger sequence at funding time; used for flash-loan resistance
 }
 
 /// Packs admin and agent_judge under one instance storage entry to cut ledger footprint.
@@ -95,7 +96,7 @@ pub struct ContractConfig {
 #[contracttype]
 pub enum DataKey {
     Job(u64),
-    Config,          // Replaces separate Admin + AgentJudge entries
+    Config, // Replaces separate Admin + AgentJudge entries
     JobRegistry,
     Locked,
     MultisigConfig(u64),
@@ -270,6 +271,13 @@ impl EscrowContract {
         }
     }
 
+    fn assert_not_same_ledger_as_funding(env: &Env, job: &EscrowJob) -> Result<(), EscrowError> {
+        if job.funded_ledger_seq != 0 && env.ledger().sequence() <= job.funded_ledger_seq {
+            return Err(EscrowError::InvalidState);
+        }
+        Ok(())
+    }
+
     fn sync_dispute_to_job_registry(env: &Env, job_id: u64) -> Result<(), EscrowError> {
         Self::bump_instance_ttl(env);
         let Some(registry_contract) = env
@@ -308,6 +316,8 @@ impl EscrowContract {
         if admin == agent_judge {
             return Err(EscrowError::InvalidInput);
         }
+
+        admin.require_auth();
 
         env.storage().instance().set(
             &DataKey::Config,
@@ -444,7 +454,16 @@ impl EscrowContract {
             panic!("job already exists");
         }
         let now: u64 = env.ledger().timestamp();
-        let expires_at = now + 30 * 24 * 60 * 60;
+        let thirty_days = 30u64
+            .checked_mul(24)
+            .and_then(|v| v.checked_mul(60))
+            .and_then(|v| v.checked_mul(60))
+            .ok_or(EscrowError::ArithmeticOverflow)
+            .expect("thirty_days overflow");
+        let expires_at = now
+            .checked_add(thirty_days)
+            .ok_or(EscrowError::ArithmeticOverflow)
+            .expect("expires_at overflow");
 
         let job = EscrowJob {
             client: client.clone(),
@@ -459,6 +478,7 @@ impl EscrowContract {
             requires_multisig: false,
             token_decimals: 0,
             dispute_deadline: 0,
+            funded_ledger_seq: 0,
         };
         log!(
             &env,
@@ -539,6 +559,7 @@ impl EscrowContract {
         job.status.validate_transition(&next_status)?;
         job.total_amount = amount;
         job.status = next_status;
+        job.funded_ledger_seq = env.ledger().sequence();
 
         // Transfer tokens from client to contract
         let token_client = token::Client::new(&env, &job.token);
@@ -572,6 +593,8 @@ impl EscrowContract {
             .get(&key)
             .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
+
+        Self::assert_not_same_ledger_as_funding(&env, &job)?;
 
         if !(job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress) {
             return Err(EscrowError::InvalidState);
@@ -655,6 +678,8 @@ impl EscrowContract {
         let mut job: EscrowJob = env.storage().persistent().get(&key).expect("job not found");
         Self::bump_job_ttl(&env, &key);
 
+        Self::assert_not_same_ledger_as_funding(&env, &job).expect("funding settlement pending");
+
         assert!(
             job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress,
             "job not in releaseable state"
@@ -728,6 +753,8 @@ impl EscrowContract {
             .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
 
+        Self::assert_not_same_ledger_as_funding(&env, &job)?;
+
         if !(job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress) {
             return Err(EscrowError::InvalidState);
         }
@@ -771,6 +798,8 @@ impl EscrowContract {
         );
 
         // 3. Job must still be active
+        Self::assert_not_same_ledger_as_funding(&env, &job)?;
+
         assert!(
             job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress,
             "dispute cannot be raised: job is not in active state"
@@ -908,6 +937,8 @@ impl EscrowContract {
             .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
 
+        Self::assert_not_same_ledger_as_funding(&env, &job)?;
+
         if !(job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress) {
             return Err(EscrowError::InvalidState);
         }
@@ -978,6 +1009,40 @@ impl EscrowContract {
         job.token_decimals
     }
 
+    /// Returns the minimum ledger separation enforced between funding and first state mutation.
+    pub fn get_funding_settlement_ledgers(_env: Env) -> u32 {
+        1
+    }
+
+    /// Returns remaining balance (total - released) for a job.
+    pub fn get_remaining_balance(env: Env, job_id: u64) -> Result<i128, EscrowError> {
+        let key = DataKey::Job(job_id);
+        let job: EscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::JobNotFound)?;
+        Self::bump_job_ttl(&env, &key);
+        job.total_amount
+            .checked_sub(job.released_amount)
+            .ok_or(EscrowError::ArithmeticOverflow)
+    }
+
+    /// Returns escrow's core live parameters for a job: total, released, and funding ledger sequence.
+    pub fn get_active_escrow_params(
+        env: Env,
+        job_id: u64,
+    ) -> Result<(i128, i128, u32), EscrowError> {
+        let key = DataKey::Job(job_id);
+        let job: EscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::JobNotFound)?;
+        Self::bump_job_ttl(&env, &key);
+        Ok((job.total_amount, job.released_amount, job.funded_ledger_seq))
+    }
+
     /// Returns the dispute resolution deadline (unix timestamp). 0 = no active dispute.
     pub fn get_dispute_deadline(env: Env, job_id: u64) -> u64 {
         let key = DataKey::Job(job_id);
@@ -1026,7 +1091,12 @@ impl EscrowContract {
             token_client.transfer(&env.current_contract_address(), &job.client, &remaining);
         }
 
-        log!(&env, "expire_dispute: job {} refunded {}", job_id, remaining);
+        log!(
+            &env,
+            "expire_dispute: job {} refunded {}",
+            job_id,
+            remaining
+        );
         env.storage().persistent().set(&key, &job);
         Self::bump_job_ttl(&env, &key);
 
@@ -2516,7 +2586,8 @@ mod test {
 
         cc.raise_dispute(&1u64, &client);
 
-        env.ledger().set_timestamp(env.ledger().timestamp() + 3 * 24 * 60 * 60);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 3 * 24 * 60 * 60);
 
         cc.resolve_dispute(&1u64, &6000i128, &0i128);
         assert_eq!(cc.get_job(&1u64).status, EscrowStatus::Resolved);
@@ -2545,7 +2616,8 @@ mod test {
         cc.deposit(&1u64, &5000i128);
 
         cc.raise_dispute(&1u64, &client);
-        env.ledger().set_timestamp(env.ledger().timestamp() + 8 * 24 * 60 * 60);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 8 * 24 * 60 * 60);
 
         cc.resolve_dispute(&1u64, &5000i128, &0i128); // DisputeResolutionExpired (#18)
     }
@@ -2575,7 +2647,8 @@ mod test {
         assert_eq!(tc.balance(&client), 92000);
 
         cc.raise_dispute(&1u64, &client);
-        env.ledger().set_timestamp(env.ledger().timestamp() + 8 * 24 * 60 * 60);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 8 * 24 * 60 * 60);
 
         cc.expire_dispute(&1u64);
         assert_eq!(cc.get_job(&1u64).status, EscrowStatus::Refunded);
