@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes};
+use soroban_sdk::{contracttype, Address, Bytes, Env};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -38,6 +38,54 @@ impl RoleMetrics {
     }
 }
 
+/// Badge tier awarded based on cumulative score thresholds.
+/// Scores are in basis points (0–10 000).
+///
+/// Thresholds:
+///   Bronze  ≥ 4 000
+///   Silver  ≥ 6 000
+///   Gold    ≥ 8 000
+///   Platinum ≥ 9 500
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BadgeLevel {
+    None,
+    Bronze,
+    Silver,
+    Gold,
+    Platinum,
+}
+
+impl BadgeLevel {
+    pub fn from_score(score: i32) -> Self {
+        match score {
+            s if s >= 9_500 => BadgeLevel::Platinum,
+            s if s >= 8_000 => BadgeLevel::Gold,
+            s if s >= 6_000 => BadgeLevel::Silver,
+            s if s >= 4_000 => BadgeLevel::Bronze,
+            _ => BadgeLevel::None,
+        }
+    }
+}
+
+/// Badge tiers keyed in the metadata map.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BadgeTier {
+    Bronze,
+    Silver,
+    Gold,
+    Platinum,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BadgeMetadataEntry {
+    pub tier: BadgeTier,
+    /// IPFS CID (or any URI) pointing to the badge image / JSON metadata.
+    pub uri: Bytes,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
@@ -46,16 +94,28 @@ pub struct Profile {
     pub freelancer: RoleMetrics,
     pub is_blacklisted: bool,
     pub metadata_hash: Option<Bytes>,
+    /// Per-tier badge metadata URIs set by the admin.
+    pub badge_metadata: soroban_sdk::Vec<BadgeMetadataEntry>,
+    pub client_badge: BadgeLevel,
+    pub freelancer_badge: BadgeLevel,
 }
 
 impl Profile {
-    pub fn new(address: Address) -> Self {
+    pub fn new(env: &Env, address: Address) -> Self {
         Self {
             address,
             client: RoleMetrics::new(),
             freelancer: RoleMetrics::new(),
             is_blacklisted: false,
             metadata_hash: None,
+            badge_metadata: soroban_sdk::Vec::new(env),
+            client_badge: BadgeLevel::Bronze,
+            freelancer_badge: BadgeLevel::Bronze,
         }
+    }
+
+    pub fn refresh_badges(&mut self) {
+        self.client_badge = BadgeLevel::from_score(self.client.score);
+        self.freelancer_badge = BadgeLevel::from_score(self.freelancer.score);
     }
 }
