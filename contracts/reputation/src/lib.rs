@@ -13,7 +13,7 @@ mod storage;
 #[derive(Clone, Debug, PartialEq)]
 pub enum JobStatus {
     Open,
-    InProgress,
+    Assigned,
     DeliverableSubmitted,
     Completed,
     Disputed,
@@ -27,6 +27,10 @@ pub struct JobRecord {
     pub metadata_hash: Bytes,
     pub budget_stroops: i128,
     pub status: JobStatus,
+    pub bid_deadline: u64,
+    pub collateral_token: Address,
+    pub collateral_amount: i128,
+    pub collateral_locked: bool,
 }
 
 #[contracttype]
@@ -628,6 +632,10 @@ mod test {
             metadata_hash: Bytes::from_slice(&env, b"QmJob"),
             budget_stroops: 10,
             status: JobStatus::Completed,
+            bid_deadline: 0,
+            collateral_token: Address::generate(&env),
+            collateral_amount: 0,
+            collateral_locked: false,
         };
         let mock_client = MockJobRegistryClient::new(&env, &mock_id);
         mock_client.set_job(&7u64, &job);
@@ -637,6 +645,10 @@ mod test {
             metadata_hash: Bytes::from_slice(&env, b"QmJob2"),
             budget_stroops: 10,
             status: JobStatus::Completed,
+            bid_deadline: 0,
+            collateral_token: Address::generate(&env),
+            collateral_amount: 0,
+            collateral_locked: false,
         };
         mock_client.set_job(&8u64, &other_job);
 
