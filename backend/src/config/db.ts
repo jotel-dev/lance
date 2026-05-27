@@ -6,7 +6,15 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const connectionString = process.env.DATABASE_URL;
-const pool = new Pool({ connectionString });
+
+// Configure resilient connection pool to survive high concurrency and prevent socket/memory leaks
+export const pool = new Pool({
+  connectionString,
+  max: 20,                          // Keep connection pool limits stable under concurrent loads
+  idleTimeoutMillis: 30000,        // Close idle connections to release resources
+  connectionTimeoutMillis: 2000,   // Fail-fast on connection bottleneck (avoid hanging sockets)
+});
+
 const adapter = new PrismaPg(pool);
 
 const globalForPrisma = global as unknown as { prisma: PrismaClient };
