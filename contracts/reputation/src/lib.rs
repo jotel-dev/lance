@@ -1,12 +1,14 @@
-#![no_std]
+﻿#![no_std]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal,
     Symbol, Vec,
 };
+pub use profile::BadgeLevel;
 
 mod profile;
 mod storage;
+pub use profile::{BadgeMetadataEntry, BadgeTier};
 
 use profile::{Profile, RoleMetrics};
 
@@ -14,10 +16,11 @@ use profile::{Profile, RoleMetrics};
 #[derive(Clone, Debug, PartialEq)]
 pub enum JobStatus {
     Open,
-    InProgress,
+    Assigned,
     DeliverableSubmitted,
     Completed,
     Disputed,
+    Expired,
 }
 
 #[contracttype]
@@ -27,7 +30,12 @@ pub struct JobRecord {
     pub freelancer: Option<Address>,
     pub metadata_hash: Bytes,
     pub budget_stroops: i128,
+    pub expires_at: u64,
     pub status: JobStatus,
+    pub bid_deadline: u64,
+    pub collateral_token: Address,
+    pub collateral_amount: i128,
+    pub collateral_locked: bool,
 }
 
 #[contracttype]
@@ -577,12 +585,14 @@ impl ReputationContract {
         let is_blacklisted = profile.is_blacklisted;
         let metrics = Self::role_metrics_mut(&mut profile, &role);
         let previous_score = metrics.score;
+        metrics.completed_jobs = metrics.completed_jobs.saturating_add(1);
         Self::apply_manual_delta(metrics, delta, is_blacklisted);
         profile.last_activity = env.ledger().timestamp();
         let new_score = metrics.score;
         let total_jobs = metrics.completed_jobs;
         let badge_level = metrics.badge_level;
 
+        profile.refresh_badges();
         storage::write_profile(&env, &address, &profile);
         env.events().publish(
             ("reputation", "ScoreAdjusted"),
@@ -617,6 +627,7 @@ impl ReputationContract {
         let total_jobs = metrics.completed_jobs;
         let badge_level = metrics.badge_level;
 
+        profile.refresh_badges();
         storage::write_profile(&env, &address, &profile);
         env.events().publish(
             ("reputation", "ScoreAdjusted"),
@@ -770,6 +781,71 @@ impl ReputationContract {
             .unwrap_or(false)
     }
 
+    /// Return the current badge level for an address/role pair.
+    pub fn get_badge(env: Env, address: Address, role: Role) -> BadgeLevel {
+        Self::bump_instance_ttl(&env);
+        let profile = storage::read_profile_or_default(&env, &address);
+        match role {
+            Role::Client => profile.client_badge,
+            Role::Freelancer => profile.freelancer_badge,
+        }
+    }
+
+    /// Admin-only: set the decentralised-storage URI for a badge tier.
+    /// `uri` is typically an IPFS CID pointing to the badge image/JSON.
+    pub fn set_badge_metadata(
+        env: Env,
+        admin: Address,
+        address: Address,
+        tier: BadgeTier,
+        uri: Bytes,
+    ) {
+        let configured_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        assert!(admin == configured_admin, "unauthorized");
+
+        let mut profile = storage::read_profile_or_default(&env, &address);
+
+        // Replace existing entry for this tier or push a new one.
+        let mut found = false;
+        let len = profile.badge_metadata.len();
+        for i in 0..len {
+            let entry = profile.badge_metadata.get(i).unwrap();
+            if entry.tier == tier {
+                profile.badge_metadata.set(i, BadgeMetadataEntry { tier: tier.clone(), uri: uri.clone() });
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            profile.badge_metadata.push_back(BadgeMetadataEntry { tier, uri });
+        }
+
+        storage::write_profile(&env, &address, &profile);
+        Self::bump_instance_ttl(&env);
+    }
+
+    /// Return the metadata URI for a given badge tier, or `None` if not set.
+    pub fn get_badge_metadata(
+        env: Env,
+        address: Address,
+        tier: BadgeTier,
+    ) -> Option<Bytes> {
+        Self::bump_instance_ttl(&env);
+        let profile = storage::read_profile_or_default(&env, &address);
+        for i in 0..profile.badge_metadata.len() {
+            let entry = profile.badge_metadata.get(i).unwrap();
+            if entry.tier == tier {
+                return Some(entry.uri);
+            }
+        }
+        None
+    }
+
     pub fn get_score(env: Env, address: Address, role: Role) -> ReputationScore {
         Self::bump_instance_ttl(&env);
         let profile = storage::read_profile_or_default(&env, &address);
@@ -911,7 +987,12 @@ mod test {
             freelancer: Some(freelancer.clone()),
             metadata_hash: Bytes::from_slice(env, b"QmJob"),
             budget_stroops: 10,
+            expires_at: 0,
             status: JobStatus::Completed,
+            bid_deadline: 0,
+            collateral_token: Address::generate(env),
+            collateral_amount: 0,
+            collateral_locked: false,
         };
         let registry_client = MockJobRegistryClient::new(env, registry);
         registry_client.set_job(&job_id, &job);
@@ -1179,6 +1260,144 @@ mod test {
 
         let saved_hash = client.get_profile_metadata(&address);
         assert_eq!(saved_hash, Some(hash));
+    }
+
+    // ΓöÇΓöÇ Issue #402: badge minting ΓöÇΓöÇ
+
+    #[test]
+    fn test_badge_starts_at_bronze_for_default_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+        client.initialize(&admin);
+
+        // Default score is 5000 ΓåÆ Bronze
+        let badge = client.get_badge(&addr, &Role::Freelancer);
+        assert_eq!(badge, BadgeLevel::Bronze);
+    }
+
+    #[test]
+    fn test_badge_upgrades_to_silver_at_6000() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+        client.initialize(&admin);
+        client.set_authorized_contract(&admin, &admin);
+
+        // Raise score by 1000 ΓåÆ 5000+1000 = 6000 ΓåÆ Silver
+        client.update_score(&admin, &addr, &Role::Freelancer, &1000);
+        let badge = client.get_badge(&addr, &Role::Freelancer);
+        assert_eq!(badge, BadgeLevel::Silver);
+    }
+
+    #[test]
+    fn test_badge_upgrades_to_gold_at_8000() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+        client.initialize(&admin);
+        client.set_authorized_contract(&admin, &admin);
+
+        client.update_score(&admin, &addr, &Role::Freelancer, &3000); // 5000+3000=8000
+        assert_eq!(client.get_badge(&addr, &Role::Freelancer), BadgeLevel::Gold);
+    }
+
+    #[test]
+    fn test_slash_downgrades_badge() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+        client.initialize(&admin);
+        client.set_authorized_contract(&admin, &admin);
+
+        // Bring to Gold first, then slash twice to drop back to Bronze
+        client.update_score(&admin, &addr, &Role::Client, &3000); // 8000 ΓåÆ Gold
+        assert_eq!(client.get_badge(&addr, &Role::Client), BadgeLevel::Gold);
+        client.slash(&admin, &addr, &Role::Client, &soroban_sdk::Symbol::new(&env, "fraud")); // 6000 ΓåÆ Silver
+        assert_eq!(client.get_badge(&addr, &Role::Client), BadgeLevel::Silver);
+        client.slash(&admin, &addr, &Role::Client, &soroban_sdk::Symbol::new(&env, "fraud")); // 4000 ΓåÆ Bronze
+        assert_eq!(client.get_badge(&addr, &Role::Client), BadgeLevel::Bronze);
+    }
+
+    // ΓöÇΓöÇ Issue #406: badge metadata mapping ΓöÇΓöÇ
+
+    #[test]
+    fn test_set_and_get_badge_metadata() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+        client.initialize(&admin);
+
+        let uri = Bytes::from_slice(&env, b"ipfs://QmBronzeBadge");
+        client.set_badge_metadata(&admin, &addr, &BadgeTier::Bronze, &uri);
+
+        let result = client.get_badge_metadata(&addr, &BadgeTier::Bronze);
+        assert_eq!(result, Some(uri));
+    }
+
+    #[test]
+    fn test_badge_metadata_returns_none_when_unset() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+
+        let result = client.get_badge_metadata(&addr, &BadgeTier::Gold);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_badge_metadata_update_overwrites_existing() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+        client.initialize(&admin);
+
+        let uri_v1 = Bytes::from_slice(&env, b"ipfs://QmSilverV1");
+        let uri_v2 = Bytes::from_slice(&env, b"ipfs://QmSilverV2");
+        client.set_badge_metadata(&admin, &addr, &BadgeTier::Silver, &uri_v1);
+        client.set_badge_metadata(&admin, &addr, &BadgeTier::Silver, &uri_v2);
+
+        assert_eq!(client.get_badge_metadata(&addr, &BadgeTier::Silver), Some(uri_v2));
+    }
+
+    #[test]
+    fn test_multiple_tiers_stored_independently() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+        client.initialize(&admin);
+
+        let bronze_uri = Bytes::from_slice(&env, b"ipfs://Bronze");
+        let gold_uri   = Bytes::from_slice(&env, b"ipfs://Gold");
+        client.set_badge_metadata(&admin, &addr, &BadgeTier::Bronze, &bronze_uri);
+        client.set_badge_metadata(&admin, &addr, &BadgeTier::Gold,   &gold_uri);
+
+        assert_eq!(client.get_badge_metadata(&addr, &BadgeTier::Bronze), Some(bronze_uri));
+        assert_eq!(client.get_badge_metadata(&addr, &BadgeTier::Gold),   Some(gold_uri));
+        assert_eq!(client.get_badge_metadata(&addr, &BadgeTier::Silver), None);
     }
 
     #[test]
