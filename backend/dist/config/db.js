@@ -39,7 +39,12 @@ exports.pool = new pg_1.Pool({
 // ---------------------------------------------------------------------------
 // Pool event listeners — structured logging for diagnostics
 // ---------------------------------------------------------------------------
-exports.pool.on("connect", () => {
+exports.pool.on("connect", (client) => {
+    client
+        .query("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .catch((err) => {
+        console.error("[POOL] Failed to configure transaction isolation:", err.message);
+    });
     if (process.env.NODE_ENV !== "production") {
         console.log(`[POOL] New client connected | total=${exports.pool.totalCount} idle=${exports.pool.idleCount} waiting=${exports.pool.waitingCount}`);
     }

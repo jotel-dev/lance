@@ -17,6 +17,7 @@ const activity_1 = __importDefault(require("./routes/activity"));
 const uploads_1 = __importDefault(require("./routes/uploads"));
 const bulk_1 = __importDefault(require("./routes/bulk"));
 const pool_1 = __importDefault(require("./routes/pool"));
+const state_1 = __importDefault(require("./routes/state"));
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const port = process.env.PORT || 3001;
@@ -35,6 +36,7 @@ app.use("/api/v1/activity", activity_1.default);
 app.use("/api/v1/uploads", uploads_1.default);
 app.use("/api/v1/bulk", bulk_1.default);
 app.use("/api/v1/pool", pool_1.default);
+app.use("/api/v1/state", state_1.default);
 // Basic healthcheck route
 app.get("/health", async (req, res) => {
     const startTime = Date.now();

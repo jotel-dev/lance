@@ -34,7 +34,13 @@ export const pool = new Pool({
 // ---------------------------------------------------------------------------
 // Pool event listeners — structured logging for diagnostics
 // ---------------------------------------------------------------------------
-pool.on("connect", () => {
+pool.on("connect", (client: PoolClient) => {
+  client
+    .query("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
+    .catch((err) => {
+      console.error("[POOL] Failed to configure transaction isolation:", err.message);
+    });
+
   if (process.env.NODE_ENV !== "production") {
     console.log(
       `[POOL] New client connected | total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`

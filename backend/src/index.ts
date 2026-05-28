@@ -12,6 +12,7 @@ import activityRoutes from "./routes/activity";
 import uploadsRoutes from "./routes/uploads";
 import bulkRoutes from "./routes/bulk";
 import poolRoutes from "./routes/pool";
+import stateRoutes from "./routes/state";
 
 dotenv.config();
 
@@ -56,6 +57,7 @@ app.use("/api/v1/activity", activityRoutes);
 app.use("/api/v1/uploads", uploadsRoutes);
 app.use("/api/v1/bulk", bulkRoutes);
 app.use("/api/v1/pool", poolRoutes);
+app.use("/api/v1/state", stateRoutes);
 
 // Health check endpoint with database connectivity verification
 app.get("/health", async (req: Request, res: Response) => {
