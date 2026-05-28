@@ -1121,7 +1121,7 @@ mod test {
         let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"bafybeigdyrzt5sbi7ee3xjc3vyqptsyfuwwspw2gx6pqdfaaaaabbbbbccccc");
+        let hash = Bytes::from_slice(&env, b"bafybeigdyrzt5sbi7ee3xjc3vyqptsyfuwwspw2gx6pqdfaaaaabbbbb");
         env.ledger().set_timestamp(100);
         let expires_at = future_expires_at(&env);
         cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at, &1000u64, &token_addr, &1000i128);
