@@ -894,6 +894,50 @@ fn release_collateral(env: &Env, job_id: u64, freelancer: Address, slash: bool) 
     }
 }
 
+fn release_collateral(env: &Env, job_id: u64, freelancer: Address, slash: bool) {
+    let bids_key = DataKey::Bids(job_id);
+    let mut bids: Vec<BidRecord> = env
+        .storage()
+        .persistent()
+        .get(&bids_key)
+        .unwrap_or_else(|| panic_with_error!(env, JobRegistryError::BidNotFound));
+
+    let mut updated = false;
+    for i in 0..bids.len() {
+        let mut bid = bids.get(i).unwrap();
+        if bid.freelancer == freelancer {
+            if bid.collateral_released {
+                panic_with_error!(
+                    env,
+                    JobRegistryError::CollateralAlreadyReleased
+                );
+            }
+            bid.collateral_released = true;
+            bids.set(i, bid);
+            updated = true;
+            break;
+        }
+    }
+
+    if !updated {
+        panic_with_error!(env, JobRegistryError::BidNotFound);
+    }
+
+    env.storage().persistent().set(&bids_key, &bids);
+
+    if slash {
+        env.events().publish(
+            (symbol_short!("slash"), job_id),
+            freelancer,
+        );
+    } else {
+        env.events().publish(
+            (symbol_short!("release"), job_id),
+            freelancer,
+        );
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -945,6 +989,8 @@ mod test {
     #[test]
     #[should_panic]
     fn test_double_initialize_panics() {
+        let (_env, cc, admin, _, _, _) = setup();
+
         let (_env, cc, admin, _, _) = setup();
  
         cc.initialize(&admin);
@@ -957,7 +1003,7 @@ mod test {
         let (env, cc, _admin, client, _, token_addr) = setup();
         let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at, &2000u64, &token_addr, &1000i128);
     }
  
     #[test]
