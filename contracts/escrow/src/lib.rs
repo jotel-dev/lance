@@ -455,8 +455,6 @@ impl EscrowContract {
         Ok(())
     }
 
-
-
     pub fn get_job_registry(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::JobRegistry)
     }
@@ -622,17 +620,17 @@ impl EscrowContract {
             amount <= Self::MAX_MILESTONE_AMOUNT,
             "milestone amount exceeds maximum"
         );
+        let next_total = checked_i128_add(job.total_amount, amount).expect("job budget overflow");
+        assert!(
+            next_total <= Self::MAX_JOB_BUDGET,
+            "job budget exceeds maximum"
+        );
         assert!(
             job.milestones.len() < Self::MAX_MILESTONES_PER_JOB,
             "too many milestones"
         );
-        if job.status != EscrowStatus::Setup {
-            return Err(EscrowError::InvalidState);
-        }
-        if amount <= 0 {
-            return Err(EscrowError::InvalidInput);
-        }
 
+        job.total_amount = next_total;
         job.milestones.push_back(Milestone {
             amount,
             status: MilestoneStatus::Pending,
@@ -672,24 +670,17 @@ impl EscrowContract {
             return Err(EscrowError::InvalidInput);
         }
 
-        // Query token decimals dynamically; custom assets vary (USDC=6, XLM=7, etc.)
-        // Query token decimals dynamically; stored so off-chain consumers can
-        // correctly display amounts (USDC=6, XLM=7, etc.).
-        // Amounts are already in the token's smallest unit so no rounding check needed.
-        let decimals = token::Client::new(&env, &job.token).decimals();
-        job.token_decimals = decimals;
-
-        let mut total_milestones_amount = 0i128;
-        for m in job.milestones.iter() {
-            total_milestones_amount = checked_i128_add(total_milestones_amount, m.amount)?;
-            total_milestones_amount =
-                Self::checked_add_i128(&env, total_milestones_amount, m.amount)?;
-        }
-
-        if total_milestones_amount != amount {
+        if job.total_amount != amount {
             return Err(EscrowError::AmountMismatch);
         }
 
+        // Query token decimals dynamically; custom assets vary (USDC=6, XLM=7, etc.).
+        // Stored so off-chain consumers can correctly display amounts.
+        // Amounts are already in the token's smallest unit so no rounding check is needed.
+        let decimals = token::Client::new(&env, &job.token).decimals();
+        job.token_decimals = decimals;
+
+        enter_reentrancy_guard(&env);
         let _guard = enter_reentrancy_guard(&env);
 
         let next_status = EscrowStatus::Funded;
@@ -1454,11 +1445,7 @@ impl EscrowContract {
     /// Admin configures the platform treasury and fee (in basis points).
     /// Once set, milestone releases route `fee_bps` of each payout to the
     /// treasury and the remainder to the freelancer.
-    pub fn set_fee_config(
-        env: Env,
-        treasury: Address,
-        fee_bps: u32,
-    ) -> Result<(), EscrowError> {
+    pub fn set_fee_config(env: Env, treasury: Address, fee_bps: u32) -> Result<(), EscrowError> {
         let admin: Address = env
             .storage()
             .instance()
@@ -1659,7 +1646,9 @@ impl EscrowContract {
             if amount <= 0 {
                 return Err(EscrowError::InvalidInput);
             }
-            new_sum = new_sum.checked_add(amount).ok_or(EscrowError::InvalidInput)?;
+            new_sum = new_sum
+                .checked_add(amount)
+                .ok_or(EscrowError::InvalidInput)?;
         }
 
         let remaining = job
@@ -1984,7 +1973,130 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #4)")]
+    #[should_panic(expected = "milestone amount exceeds maximum")]
+    fn test_add_milestone_over_max_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let agent_judge = Address::generate(&env);
+        let client = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+
+        let token_addr = setup_token(&env, &admin);
+        mint(&env, &token_addr, &client);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+
+        cc.initialize(&admin, &agent_judge);
+        cc.create_job(&1u64, &client, &freelancer, &token_addr);
+
+        cc.add_milestone(&1u64, &(EscrowContract::MAX_MILESTONE_AMOUNT + 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "too many milestones")]
+    fn test_add_milestone_limit_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let agent_judge = Address::generate(&env);
+        let client = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+
+        let token_addr = setup_token(&env, &admin);
+        mint(&env, &token_addr, &client);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+
+        cc.initialize(&admin, &agent_judge);
+        cc.create_job(&1u64, &client, &freelancer, &token_addr);
+
+        for _ in 0..EscrowContract::MAX_MILESTONES_PER_JOB {
+            cc.add_milestone(&1u64, &250i128);
+        }
+        cc.add_milestone(&1u64, &250i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "job budget exceeds maximum")]
+    fn test_add_milestone_over_max_budget_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let agent_judge = Address::generate(&env);
+        let client = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+
+        let token_addr = setup_token(&env, &admin);
+        mint(&env, &token_addr, &client);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+
+        cc.initialize(&admin, &agent_judge);
+        cc.create_job(&1u64, &client, &freelancer, &token_addr);
+        cc.add_milestone(&1u64, &10_000_000_000i128);
+        cc.add_milestone(&1u64, &1i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #12)")]
+    fn test_deposit_reentrancy_guard_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let agent_judge = Address::generate(&env);
+        let client = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+
+        let token_addr = setup_token(&env, &admin);
+        mint(&env, &token_addr, &client);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+
+        cc.initialize(&admin, &agent_judge);
+        cc.create_job(&1u64, &client, &freelancer, &token_addr);
+        cc.add_milestone(&1u64, &1000i128);
+
+        env.storage().instance().set(&DataKey::Locked, &());
+        cc.deposit(&1u64, &1000i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #12)")]
+    fn test_release_milestone_reentrancy_guard_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let agent_judge = Address::generate(&env);
+        let client = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+
+        let token_addr = setup_token(&env, &admin);
+        mint(&env, &token_addr, &client);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+
+        cc.initialize(&admin, &agent_judge);
+        cc.create_job(&1u64, &client, &freelancer, &token_addr);
+        cc.add_milestone(&1u64, &1000i128);
+        cc.deposit(&1u64, &1000i128);
+
+        env.storage().instance().set(&DataKey::Locked, &());
+        cc.release_milestone(&1u64, &client);
+    }
+
+    #[test]
+    #[should_panic(expected = "job already exists")]
     fn test_double_create_job_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2402,33 +2514,23 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #4)")]
-    fn test_deposit_over_max_budget_panics() {
+    #[should_panic(expected = "job already exists")]
+    fn test_double_create_job_panics() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let admin = Address::generate(&env);
-        let agent_judge = Address::generate(&env);
         let client = Address::generate(&env);
         let freelancer = Address::generate(&env);
-
-        let token_addr = setup_token(&env, &admin);
-        mint(&env, &token_addr, &client);
+        let token_addr = Address::generate(&env);
 
         let contract_id = env.register_contract(None, EscrowContract);
         let cc = EscrowContractClient::new(&env, &contract_id);
 
-        cc.initialize(&admin, &agent_judge);
         cc.create_job(&1u64, &client, &freelancer, &token_addr);
-        cc.add_milestone(&1u64, &6_000_000_000i128);
-        cc.add_milestone(&1u64, &5_000_000_000i128);
-
-        cc.deposit(&1u64, &11_000_000_000i128);
+        cc.create_job(&1u64, &client, &freelancer, &token_addr);
     }
 
     #[test]
-    #[should_panic(expected = "job already exists")]
-    fn test_double_create_job_panics() {
     #[should_panic(expected = "Error(Contract, #6)")]
     fn test_release_funds_twice_panics() {
         let env = Env::default();
