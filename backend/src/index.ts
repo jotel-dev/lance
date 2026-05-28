@@ -2,6 +2,8 @@ import express, { Express, Request, Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { prisma, connectWithRetry, startPoolHealthCheck } from "./config/db";
+import { trace } from "./config/tracing";
+import { intakeRateLimit } from "./middleware/intakeRateLimit";
 import { tracingMiddleware } from "./utils/tracing";
 import authRoutes from "./routes/auth";
 import jobsRoutes from "./routes/jobs";
@@ -23,6 +25,7 @@ const logger = trace.getLogger("server");
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use(tracingMiddleware); // Global request tracing and diagnostics
+app.use(intakeRateLimit);
 
 // Request logging middleware with tracing
 app.use((req: Request, res: Response, next) => {
