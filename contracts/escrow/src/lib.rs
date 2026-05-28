@@ -99,8 +99,45 @@ pub enum DataKey {
     Config, // Replaces separate Admin + AgentJudge entries
     JobRegistry,
     Locked,
+    Treasury,
+    FeeBps,
     MultisigConfig(u64), // Per-job multisig configuration
     UpgradeAdmin,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct FeeConfigUpdatedEvent {
+    pub treasury: Address,
+    pub fee_bps: u32,
+    pub updated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LockupUpdatedEvent {
+    pub job_id: u64,
+    pub expires_at: u64,
+    pub updated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct EmergencySweepEvent {
+    pub job_id: u64,
+    pub admin: Address,
+    pub rescue_address: Address,
+    pub amount: i128,
+    pub swept_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MilestonesAmendedEvent {
+    pub job_id: u64,
+    pub milestone_count: u32,
+    pub remaining_amount: i128,
+    pub amended_at: u64,
 }
 
 #[contracttype]
@@ -143,6 +180,8 @@ pub enum EscrowError {
     InvalidStateTransition = 11,
     ReentrancyDetected = 12,
     MultisigRequired = 13,
+    FeeTooHigh = 21,
+    NothingToSweep = 22,
     InsufficientSignatures = 14,
     AlreadySigned = 15,
     ArithmeticError = 16,
@@ -680,7 +719,6 @@ impl EscrowContract {
         let decimals = token::Client::new(&env, &job.token).decimals();
         job.token_decimals = decimals;
 
-        enter_reentrancy_guard(&env);
         let _guard = enter_reentrancy_guard(&env);
 
         let next_status = EscrowStatus::Funded;
@@ -744,7 +782,6 @@ impl EscrowContract {
         milestone.status = MilestoneStatus::Released;
         job.milestones.set(idx, milestone.clone());
 
-        job.released_amount = checked_i128_add(job.released_amount, milestone.amount)?;
         job.released_amount = Self::checked_add_i128(&env, job.released_amount, milestone.amount)?;
 
         let next_status = if job.released_amount == job.total_amount {
@@ -758,7 +795,7 @@ impl EscrowContract {
         let _guard = enter_reentrancy_guard(&env);
         env.storage().persistent().set(&key, &job);
 
-        Self::payout_with_fee(&env, job_id, &job, milestone.amount);
+        Self::payout_with_fee(&env, &job, milestone.amount);
 
         log!(
             &env,
@@ -811,12 +848,7 @@ impl EscrowContract {
         milestone.status = MilestoneStatus::Released;
         job.milestones.set(milestone_index, milestone.clone());
 
-        job.released_amount =
-            checked_i128_add(job.released_amount, milestone.amount).expect("math overflow");
-        job.released_amount = job
-            .released_amount
-            .checked_add(milestone.amount)
-            .expect("released_amount overflow");
+        job.released_amount = Self::checked_add_i128(&env, job.released_amount, milestone.amount)?;
         assert!(
             job.released_amount <= job.total_amount,
             "double-spend: released exceeds total"
@@ -832,7 +864,7 @@ impl EscrowContract {
         let _guard = enter_reentrancy_guard(&env);
         env.storage().persistent().set(&key, &job);
 
-        Self::payout_with_fee(&env, job_id, &job, milestone.amount);
+        Self::payout_with_fee(&env, &job, milestone.amount);
 
         log!(
             &env,
@@ -840,6 +872,8 @@ impl EscrowContract {
             job_id,
             milestone.amount
         );
+
+        Ok(())
     }
 
     /// Either party opens a dispute, locking remaining funds.
@@ -1029,6 +1063,8 @@ impl EscrowContract {
             payee_amount,
             payer_amount
         );
+
+        Ok(())
     }
 
     /// Client recoups funds if freelancer never responded or deadline has passed.
@@ -1446,11 +1482,12 @@ impl EscrowContract {
     /// Once set, milestone releases route `fee_bps` of each payout to the
     /// treasury and the remainder to the freelancer.
     pub fn set_fee_config(env: Env, treasury: Address, fee_bps: u32) -> Result<(), EscrowError> {
-        let admin: Address = env
+        let config: ContractConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
+            .get(&DataKey::Config)
             .ok_or(EscrowError::NotInitialized)?;
+        let admin = config.admin;
         admin.require_auth();
 
         if fee_bps > MAX_FEE_BPS {
@@ -1481,6 +1518,41 @@ impl EscrowContract {
     /// Returns the configured treasury address, if any.
     pub fn get_treasury(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Treasury)
+    }
+
+    fn fee_bps(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get::<_, u32>(&DataKey::FeeBps)
+            .unwrap_or(0u32)
+    }
+
+    fn payout_with_fee(env: &Env, job: &EscrowJob, amount: i128) {
+        let treasury = env.storage().instance().get::<_, Address>(&DataKey::Treasury);
+        let fee_bps = Self::fee_bps(env);
+        let fee_amount = if fee_bps > 0 {
+            amount
+                .checked_mul(fee_bps as i128)
+                .and_then(|value| value.checked_div(10_000))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let payout_amount = amount.checked_sub(fee_amount).unwrap_or(0);
+        let token_client = token::Client::new(env, &job.token);
+
+        if fee_amount > 0 {
+            if let Some(treasury_addr) = treasury {
+                token_client.transfer(&env.current_contract_address(), &treasury_addr, &fee_amount);
+            }
+        }
+        if payout_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &job.freelancer, &payout_amount);
+        }
+    }
+
+    fn exit_reentrancy_guard(env: &Env) {
+        env.storage().instance().remove(&DataKey::Locked);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1556,11 +1628,12 @@ impl EscrowContract {
         job_id: u64,
         rescue_address: Address,
     ) -> Result<(), EscrowError> {
-        let admin: Address = env
+        let config: ContractConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
+            .get(&DataKey::Config)
             .ok_or(EscrowError::NotInitialized)?;
+        let admin = config.admin;
         admin.require_auth();
 
         let key = DataKey::Job(job_id);
@@ -1579,7 +1652,7 @@ impl EscrowContract {
             return Err(EscrowError::NothingToSweep);
         }
 
-        enter_reentrancy_guard(&env);
+        let _guard = enter_reentrancy_guard(&env);
 
         // Override the state machine: mark fully released and refunded.
         job.released_amount = job.total_amount;
@@ -1591,7 +1664,7 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &job);
         Self::bump_job_ttl(&env, &key);
 
-        exit_reentrancy_guard(&env);
+        Self::exit_reentrancy_guard(&env);
 
         env.events().publish(
             ("escrow", "EmergencySweep"),
@@ -2065,7 +2138,9 @@ mod test {
         cc.create_job(&1u64, &client, &freelancer, &token_addr);
         cc.add_milestone(&1u64, &1000i128);
 
-        env.storage().instance().set(&DataKey::Locked, &());
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::Locked, &());
+        });
         cc.deposit(&1u64, &1000i128);
     }
 
@@ -2091,12 +2166,14 @@ mod test {
         cc.add_milestone(&1u64, &1000i128);
         cc.deposit(&1u64, &1000i128);
 
-        env.storage().instance().set(&DataKey::Locked, &());
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::Locked, &());
+        });
         cc.release_milestone(&1u64, &client);
     }
 
     #[test]
-    #[should_panic(expected = "job already exists")]
+    #[should_panic(expected = "Error(Contract, #4)")]
     fn test_double_create_job_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2462,72 +2539,6 @@ mod test {
         cc.deposit(&1u64, &3000i128);
 
         cc.release_funds(&1u64, &client, &5u32);
-    }
-
-    #[test]
-    #[should_panic(expected = "milestone amount exceeds maximum")]
-    fn test_add_milestone_over_max_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let agent_judge = Address::generate(&env);
-        let client = Address::generate(&env);
-        let freelancer = Address::generate(&env);
-
-        let token_addr = setup_token(&env, &admin);
-        mint(&env, &token_addr, &client);
-
-        let contract_id = env.register_contract(None, EscrowContract);
-        let cc = EscrowContractClient::new(&env, &contract_id);
-
-        cc.initialize(&admin, &agent_judge);
-        cc.create_job(&1u64, &client, &freelancer, &token_addr);
-
-        cc.add_milestone(&1u64, &(EscrowContract::MAX_MILESTONE_AMOUNT + 1));
-    }
-
-    #[test]
-    #[should_panic(expected = "too many milestones")]
-    fn test_add_milestone_limit_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let agent_judge = Address::generate(&env);
-        let client = Address::generate(&env);
-        let freelancer = Address::generate(&env);
-
-        let token_addr = setup_token(&env, &admin);
-        mint(&env, &token_addr, &client);
-
-        let contract_id = env.register_contract(None, EscrowContract);
-        let cc = EscrowContractClient::new(&env, &contract_id);
-
-        cc.initialize(&admin, &agent_judge);
-        cc.create_job(&1u64, &client, &freelancer, &token_addr);
-
-        for _ in 0..EscrowContract::MAX_MILESTONES_PER_JOB {
-            cc.add_milestone(&1u64, &250i128);
-        }
-        cc.add_milestone(&1u64, &250i128);
-    }
-
-    #[test]
-    #[should_panic(expected = "job already exists")]
-    fn test_double_create_job_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let client = Address::generate(&env);
-        let freelancer = Address::generate(&env);
-        let token_addr = Address::generate(&env);
-
-        let contract_id = env.register_contract(None, EscrowContract);
-        let cc = EscrowContractClient::new(&env, &contract_id);
-
-        cc.create_job(&1u64, &client, &freelancer, &token_addr);
-        cc.create_job(&1u64, &client, &freelancer, &token_addr);
     }
 
     #[test]

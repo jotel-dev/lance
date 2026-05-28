@@ -220,7 +220,6 @@ impl ReputationContract {
         }
     }
 
-    fn score_from_profile(address: &Address, role: Role, profile: &profile::Profile) -> ReputationScore {
     fn score_from_profile(
         address: &Address,
         role: Role,
@@ -472,19 +471,6 @@ impl ReputationContract {
         Self::require_authorized_contract(&env, &caller_contract);
 
         let mut profile = storage::read_profile_or_default(&env, &address);
-        let (new_score, total_jobs) = match role {
-            Role::Client => {
-                profile.client_score = Self::clamp_score(profile.client_score.saturating_add(delta));
-                profile.client_jobs = profile.client_jobs.saturating_add(1);
-                (profile.client_score, profile.client_jobs)
-            }
-            Role::Freelancer => {
-                profile.freelancer_score =
-                    Self::clamp_score(profile.freelancer_score.saturating_add(delta));
-                profile.freelancer_jobs = profile.freelancer_jobs.saturating_add(1);
-                (profile.freelancer_score, profile.freelancer_jobs)
-            }
-        };
         if profile.is_blacklisted {
             soroban_sdk::panic_with_error!(&env, ReputationError::Blacklisted);
         }
@@ -492,6 +478,7 @@ impl ReputationContract {
         let is_blacklisted = profile.is_blacklisted;
         let metrics = Self::role_metrics_mut(&mut profile, &role);
         let previous_score = metrics.score;
+        metrics.completed_jobs = metrics.completed_jobs.saturating_add(1);
         Self::apply_manual_delta(metrics, delta, is_blacklisted);
         let new_score = metrics.score;
         let total_jobs = metrics.completed_jobs;

@@ -619,6 +619,44 @@ fn post_job_with_id(
         .set(&DataKey::Bids(job_id), &bids);
 }
 
+fn release_collateral(env: &Env, job_id: u64, freelancer: Address, _slash: bool) {
+    let _job: JobRecord = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Job(job_id))
+        .unwrap_or_else(|| panic_with_error!(env, JobRegistryError::JobNotFound));
+
+    let bids_key = DataKey::Bids(job_id);
+    let bids: Vec<BidRecord> = env
+        .storage()
+        .persistent()
+        .get(&bids_key)
+        .unwrap_or_else(|| panic_with_error!(env, JobRegistryError::CollateralNotFound));
+
+    let mut updated_bids: Vec<BidRecord> = Vec::new(env);
+    let mut found = false;
+
+    for bid in bids.iter() {
+        if bid.freelancer == freelancer {
+            found = true;
+            if bid.collateral_released {
+                panic_with_error!(env, JobRegistryError::CollateralAlreadyReleased);
+            }
+            let mut updated = bid.clone();
+            updated.collateral_released = true;
+            updated_bids.push_back(updated);
+        } else {
+            updated_bids.push_back(bid.clone());
+        }
+    }
+
+    if !found {
+        panic_with_error!(env, JobRegistryError::CollateralNotFound);
+    }
+
+    env.storage().persistent().set(&bids_key, &updated_bids);
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -649,6 +687,12 @@ mod test {
         env.ledger().timestamp() + 60
     }
 
+    fn default_bidding_deadline(env: &Env) -> u64 {
+        env.ledger().timestamp() + 30
+    }
+
+    const DEFAULT_COLLATERAL_STROOPS: i128 = 1_000;
+
     #[test]
     fn test_initialize_bootstraps_storage() {
         let (_env, cc, admin, _, _) = setup();
@@ -675,7 +719,7 @@ mod test {
         let (env, cc, _admin, client, _) = setup();
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
     }
 
     #[test]
@@ -688,8 +732,8 @@ mod test {
         let expires_at1 = future_expires_at(&env);
         let expires_at2 = future_expires_at(&env);
 
-        let id1 = cc.post_job_auto(&client, &hash1, &MIN_BUDGET_STROOPS, &expires_at1);
-        let id2 = cc.post_job_auto(&client, &hash2, &MIN_BUDGET_STROOPS, &expires_at2);
+        let id1 = cc.post_job_auto(&client, &hash1, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at1);
+        let id2 = cc.post_job_auto(&client, &hash2, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at2);
 
         assert_eq!(id1, 1u64);
         assert_eq!(id2, 2u64);
@@ -703,7 +747,7 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&42u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&42u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         assert_eq!(cc.get_next_job_id(), 43u64);
     }
@@ -716,7 +760,7 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &0i128, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &0i128, &default_bidding_deadline(&env), &expires_at);
     }
 
     #[test]
@@ -727,7 +771,7 @@ mod test {
 
         let empty = Bytes::from_slice(&env, b"");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &empty, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &empty, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
     }
 
     #[test]
@@ -737,14 +781,14 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmSomeIPFSHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         let job = cc.get_job(&1u64);
         assert_eq!(job.status, JobStatus::Open);
         assert_eq!(job.freelancer, None);
 
         let proposal = Bytes::from_slice(&env, b"QmProposalHash");
-        cc.submit_bid(&1u64, &freelancer, &proposal);
+        cc.submit_bid(&1u64, &freelancer, &proposal, &DEFAULT_COLLATERAL_STROOPS);
 
         let bids = cc.get_bids(&1u64);
         assert_eq!(bids.len(), 1);
@@ -772,11 +816,11 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         let proposal = Bytes::from_slice(&env, b"QmProposal");
-        cc.submit_bid(&1u64, &freelancer, &proposal);
-        cc.submit_bid(&1u64, &freelancer, &proposal);
+        cc.submit_bid(&1u64, &freelancer, &proposal, &DEFAULT_COLLATERAL_STROOPS);
+        cc.submit_bid(&1u64, &freelancer, &proposal, &DEFAULT_COLLATERAL_STROOPS);
     }
 
     #[test]
@@ -787,7 +831,7 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         cc.accept_bid(&1u64, &client, &freelancer);
     }
@@ -799,10 +843,10 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         let proposal = Bytes::from_slice(&env, b"QmProposal");
-        cc.submit_bid(&1u64, &freelancer, &proposal);
+        cc.submit_bid(&1u64, &freelancer, &proposal, &DEFAULT_COLLATERAL_STROOPS);
         cc.accept_bid(&1u64, &client, &freelancer);
 
         cc.mark_disputed(&1u64);
@@ -818,7 +862,7 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         cc.mark_disputed(&1u64);
     }
@@ -831,45 +875,12 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         env.ledger().set_timestamp(expires_at + 1);
 
         let proposal = Bytes::from_slice(&env, b"QmProposal");
-        cc.submit_bid(&1u64, &freelancer, &proposal);
-    }
-
-    let mut bids: Vec<BidRecord> = env
-        .storage()
-        .persistent()
-        .get(&bids_key)
-        .unwrap_or(Vec::new(env));
-
-        let hash = Bytes::from_slice(&env, b"QmHash");
-        let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
-
-    for i in 0..bids.len() {
-        let mut bid = bids.get(i).unwrap();
-
-        if bid.freelancer == freelancer {
-            if bid.collateral_released {
-                panic_with_error!(
-                    env,
-                    JobRegistryError::CollateralAlreadyReleased
-                );
-            }
-
-            bid.collateral_released = true;
-
-        let hash = Bytes::from_slice(&env, b"QmHash");
-        let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
-
-            updated = true;
-
-            break;
-        }
+        cc.submit_bid(&1u64, &freelancer, &proposal, &DEFAULT_COLLATERAL_STROOPS);
     }
 
     #[test]
@@ -880,18 +891,9 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         cc.cancel_expired_job(&1u64, &client);
-    }
-
-    env.storage().persistent().set(&bids_key, &bids);
-
-        let hash = Bytes::from_slice(&env, b"QmHash");
-        let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
-
-        cc.get_deliverable(&1u64);
     }
 
     // --- SC-REG-037: Budget Bounds Tests ---
@@ -903,7 +905,7 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         let job = cc.get_job(&1u64);
         assert_eq!(job.budget_stroops, MIN_BUDGET_STROOPS);
@@ -916,7 +918,7 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MAX_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MAX_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         let job = cc.get_job(&1u64);
         assert_eq!(job.budget_stroops, MAX_BUDGET_STROOPS);
@@ -930,7 +932,7 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &(MIN_BUDGET_STROOPS - 1), &expires_at);
+        cc.post_job(&1u64, &client, &hash, &(MIN_BUDGET_STROOPS - 1), &default_bidding_deadline(&env), &expires_at);
     }
 
     #[test]
@@ -941,7 +943,7 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &(MAX_BUDGET_STROOPS + 1), &expires_at);
+        cc.post_job(&1u64, &client, &hash, &(MAX_BUDGET_STROOPS + 1), &default_bidding_deadline(&env), &expires_at);
     }
 
     #[test]
@@ -952,7 +954,7 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &0i128, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &0i128, &default_bidding_deadline(&env), &expires_at);
     }
 
     // --- SC-REG-039: Paginated Bids Tests ---
@@ -964,7 +966,7 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         assert_eq!(cc.get_bids_count(&1u64), 0u32);
     }
@@ -976,12 +978,12 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         for _ in 0..3u32 {
             let freelancer = Address::generate(&env);
             let proposal = Bytes::from_slice(&env, b"QmProposal");
-            cc.submit_bid(&1u64, &freelancer, &proposal);
+            cc.submit_bid(&1u64, &freelancer, &proposal, &DEFAULT_COLLATERAL_STROOPS);
         }
 
         assert_eq!(cc.get_bids_count(&1u64), 3u32);
@@ -994,12 +996,12 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         for _ in 0..5u32 {
             let freelancer = Address::generate(&env);
             let proposal = Bytes::from_slice(&env, b"QmProposal");
-            cc.submit_bid(&1u64, &freelancer, &proposal);
+            cc.submit_bid(&1u64, &freelancer, &proposal, &DEFAULT_COLLATERAL_STROOPS);
         }
 
         let page = cc.get_bids_page(&1u64, &0u32, &3u32);
@@ -1013,12 +1015,12 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         for _ in 0..5u32 {
             let freelancer = Address::generate(&env);
             let proposal = Bytes::from_slice(&env, b"QmProposal");
-            cc.submit_bid(&1u64, &freelancer, &proposal);
+            cc.submit_bid(&1u64, &freelancer, &proposal, &DEFAULT_COLLATERAL_STROOPS);
         }
 
         let page = cc.get_bids_page(&1u64, &3u32, &3u32);
@@ -1032,12 +1034,12 @@ mod test {
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
         for _ in 0..3u32 {
             let freelancer = Address::generate(&env);
             let proposal = Bytes::from_slice(&env, b"QmProposal");
-            cc.submit_bid(&1u64, &freelancer, &proposal);
+            cc.submit_bid(&1u64, &freelancer, &proposal, &DEFAULT_COLLATERAL_STROOPS);
         }
 
         let page = cc.get_bids_page(&1u64, &10u32, &5u32);
