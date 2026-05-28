@@ -1,0 +1,24 @@
+import path from "node:path";
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    environment: "jsdom",
+    setupFiles: ["./vitest.setup.ts"],
+    globals: true,
+    css: false,  // Disable CSS processing to avoid PostCSS/lightningcss dependency in tests
+    coverage: {
+      reporter: ["text", "html"],
+      include: [
+        "components/theme/theme-toggle.tsx",
+        "lib/notifications.ts",
+        "lib/profile.ts",
+      ],
+    },
+  },
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./"),
+    },
+  },
+});

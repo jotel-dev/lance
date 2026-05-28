@@ -1,7 +1,33 @@
 /docs/ISSUES.md
 
-/node_modules
+# Node dependencies
+/node_modules/
+
+# Rust build target
+/target/
+
+# Playwright / Testing outputs
+/playwright-report/
+/test-results/
+
+# Local/IDE/Agent environments
+.vscode/
+.antigravitycli/
+.kiro/
+/antigravity/
 
 
+# Env files
+.env*
+*.env
+.env
+!.env.example
 
-/target
+.vercel
+
+# Issues docs
+/docs/issues/
+/docs/ISSUES_CATALOG.md
+
+# Automation scripts
+/scripts/
