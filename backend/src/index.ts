@@ -5,6 +5,8 @@ import { prisma, connectWithRetry, startPoolHealthCheck } from "./config/db";
 import { trace } from "./config/tracing";
 import { intakeRateLimit } from "./middleware/intakeRateLimit";
 import { tracingMiddleware } from "./utils/tracing";
+import { metricsMiddleware } from "./middleware/metrics";
+import { createMetricsRouter, updatePoolMetrics } from "./utils/metrics";
 import authRoutes from "./routes/auth";
 import jobsRoutes from "./routes/jobs";
 import disputesRoutes from "./routes/disputes";
@@ -15,6 +17,7 @@ import uploadsRoutes from "./routes/uploads";
 import bulkRoutes from "./routes/bulk";
 import poolRoutes from "./routes/pool";
 import stateRoutes from "./routes/state";
+import { pool } from "./config/db";
 
 dotenv.config();
 
@@ -27,6 +30,7 @@ app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use(tracingMiddleware); // Global request tracing and diagnostics
 app.use(intakeRateLimit);
+app.use(metricsMiddleware);
 
 // Request logging middleware with tracing
 app.use((req: Request, res: Response, next) => {
@@ -61,6 +65,7 @@ app.use("/api/v1/uploads", uploadsRoutes);
 app.use("/api/v1/bulk", bulkRoutes);
 app.use("/api/v1/pool", poolRoutes);
 app.use("/api/v1/state", stateRoutes);
+app.use("/api/v1/metrics", createMetricsRouter());
 
 // Health check endpoint with database connectivity verification
 app.get("/health", async (req: Request, res: Response) => {
@@ -125,6 +130,10 @@ async function bootstrap(): Promise<void> {
     startPoolHealthCheck();
     app.listen(port, () => {
       console.log(`⚡️[server]: Server is running at http://localhost:${port}`);
+      // Update pool metrics periodically so the Prometheus scrape has fresh data
+      setInterval(() => {
+        updatePoolMetrics(pool.totalCount, pool.idleCount, pool.waitingCount);
+      }, 15_000).unref();
     });
   } catch (err: any) {
     console.error(`❌ Failed to start server: ${err.message}`);
